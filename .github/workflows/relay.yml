@@ -1,0 +1,60 @@
+name: relay
+
+# Workflow que ejecuta el relay en GitHub Actions de forma programada.
+# Diseñado para respetar el límite de 6h/job: corre 5h30min y deja margen
+# para que el proceso haga shutdown graceful al recibir SIGTERM.
+
+on:
+  schedule:
+    # Cada 5h30min aprox. Cron GH corre en UTC.
+    # 0 0,5,10,15,20 * * * → a las 00:00, 05:00, 10:00, 15:00, 20:00 UTC
+    - cron: '0 0,5,10,15,20 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# Evita solapes: si un run anterior aún no ha terminado, se cancela el nuevo
+# (o viceversa). concurrency usa last-in-wins por defecto.
+concurrency:
+  group: relay-run
+  cancel-in-progress: false
+
+jobs:
+  run-relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330  # 5h30min, deja 30 min de margen antes del límite de 6h
+    env:
+      PROXY_SHARED_SECRET: ${{ secrets.PROXY_SHARED_SECRET }}
+      ALLOWLIST: ${{ vars.ALLOWLIST }}
+      TODUS_BASE_URL: ${{ vars.TODUS_BASE_URL }}
+      ENCRYPTION_ENABLED: ${{ vars.ENCRYPTION_ENABLED }}
+      LOG_LEVEL: ${{ vars.LOG_LEVEL }}
+      MAX_SESSIONS: ${{ vars.MAX_SESSIONS }}
+      HEARTBEAT_INTERVAL: ${{ vars.HEARTBEAT_INTERVAL }}
+      SESSION_MAX_DURATION: ${{ vars.SESSION_MAX_DURATION }}
+      SHUTDOWN_TIMEOUT: ${{ vars.SHUTDOWN_TIMEOUT }}
+      # USER_AGENT: ${{ vars.USER_AGENT }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate secret present
+        run: |
+          if [ -z "$PROXY_SHARED_SECRET" ]; then
+            echo "::error::Falta el secret PROXY_SHARED_SECRET (mínimo 32 bytes hex). Genéralo con: openssl rand -hex 32"
+            exit 1
+          fi
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Build
+        run: go build -trimpath -ldflags="-s -w" -o /tmp/relay .
+
+      - name: Run relay (foreground, graceful shutdown on SIGTERM)
+        # GitHub envía SIGTERM con ~30s de gracia al alcanzar timeout-minutes
+        # o al cancelar el workflow. El binario lo captura y cierra sesiones.
+        run: /tmp/relay

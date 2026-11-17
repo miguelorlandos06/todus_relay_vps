@@ -1,0 +1,26 @@
+# Entorno local
+.env
+.env.local
+*.env.local
+
+# Binarios
+/todus_relay_vps
+/bin/
+/dist/
+*.exe
+*.test
+*.prof
+*.out
+
+# Go
+vendor/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*~
+
+# Logs / runtime
+*.log
