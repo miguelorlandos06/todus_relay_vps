@@ -1,60 +1,63 @@
-name: relay
-
-# Workflow que ejecuta el relay en GitHub Actions de forma programada.
-# Diseñado para respetar el límite de 6h/job: corre 5h30min y deja margen
-# para que el proceso haga shutdown graceful al recibir SIGTERM.
+name: relay-server
 
 on:
-  schedule:
-    # Cada 5h30min aprox. Cron GH corre en UTC.
-    # 0 0,5,10,15,20 * * * → a las 00:00, 05:00, 10:00, 15:00, 20:00 UTC
-    - cron: '0 0,5,10,15,20 * * *'
-  workflow_dispatch: {}
+  push:
+    branches: [ main ]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
-# Evita solapes: si un run anterior aún no ha terminado, se cancela el nuevo
-# (o viceversa). concurrency usa last-in-wins por defecto.
-concurrency:
-  group: relay-run
-  cancel-in-progress: false
-
 jobs:
   run-relay:
+    name: Relay Server
     runs-on: ubuntu-latest
-    timeout-minutes: 330  # 5h30min, deja 30 min de margen antes del límite de 6h
-    env:
-      PROXY_SHARED_SECRET: ${{ secrets.PROXY_SHARED_SECRET }}
-      ALLOWLIST: ${{ vars.ALLOWLIST }}
-      TODUS_BASE_URL: ${{ vars.TODUS_BASE_URL }}
-      ENCRYPTION_ENABLED: ${{ vars.ENCRYPTION_ENABLED }}
-      LOG_LEVEL: ${{ vars.LOG_LEVEL }}
-      MAX_SESSIONS: ${{ vars.MAX_SESSIONS }}
-      HEARTBEAT_INTERVAL: ${{ vars.HEARTBEAT_INTERVAL }}
-      SESSION_MAX_DURATION: ${{ vars.SESSION_MAX_DURATION }}
-      SHUTDOWN_TIMEOUT: ${{ vars.SHUTDOWN_TIMEOUT }}
-      # USER_AGENT: ${{ vars.USER_AGENT }}
+    timeout-minutes: 360
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Validate secret present
+      - name: Cancelar run anterior si está corriendo
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
-          if [ -z "$PROXY_SHARED_SECRET" ]; then
-            echo "::error::Falta el secret PROXY_SHARED_SECRET (mínimo 32 bytes hex). Genéralo con: openssl rand -hex 32"
-            exit 1
-          fi
+          echo "Buscando runs en progreso..."
+          CURRENT_RUN_ID=${{ github.run_id }}
+          RUNS=$(gh run list --repo "$REPO" --workflow "relay-server" --status in_progress --json databaseId -q '.[].databaseId')
+          for RUN_ID in $RUNS; do
+            if [ "$RUN_ID" != "$CURRENT_RUN_ID" ]; then
+              echo "Cancelando run anterior: $RUN_ID"
+              gh run cancel "$RUN_ID" --repo "$REPO" || true
+            fi
+          done
 
-      - name: Set up Go
+      - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
           cache: true
 
-      - name: Build
-        run: go build -trimpath -ldflags="-s -w" -o /tmp/relay .
+      - name: Compilar relay
+        run: go build -o todus_relay_vps .
 
-      - name: Run relay (foreground, graceful shutdown on SIGTERM)
-        # GitHub envía SIGTERM con ~30s de gracia al alcanzar timeout-minutes
-        # o al cancelar el workflow. El binario lo captura y cierra sesiones.
-        run: /tmp/relay
+      - name: Ejecutar relay
+        env:
+          PROXY_SHARED_SECRET: ${{ secrets.PROXY_SHARED_SECRET }}
+          TODUS_BASE_URL: ${{ secrets.TODUS_BASE_URL }}
+          ALLOWLIST: ${{ secrets.ALLOWLIST }}
+          LOG_LEVEL: info
+        run: |
+          timeout 16200 ./todus_relay_vps || true
+
+      - name: Esperar y relanzar
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "Esperando 30 minutos para margen de seguridad..."
+          sleep 1800
+          echo "Lanzando el siguiente run automáticamente..."
+          gh workflow run "relay-server" --repo "$REPO"
