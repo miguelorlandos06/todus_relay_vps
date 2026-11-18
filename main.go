@@ -437,7 +437,7 @@ func handleTCPSession(ctx context.Context, sessionID string, target SessionTarge
 			seq++
 			sinceAck++
 			atomic.StoreInt64(&lastAct, time.Now().UnixNano())
-			if sinceAck >= settings.AckEvery || time.Since(lastAckTime) > time.Second {
+			if sinceAck >= settings.AckEvery || time.Since(lastAckTime) > 5*time.Second {
 				store.Put(AckKey("c2s", sessionID), EncodeCounter(seq))
 				sinceAck = 0
 				lastAckTime = time.Now()

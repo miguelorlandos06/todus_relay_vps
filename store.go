@@ -67,9 +67,9 @@ type TodusStore struct {
 
 func NewTodusStore(settings *Settings) *TodusStore {
 	tr := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 50,
-		MaxConnsPerHost:     50,
+		MaxIdleConns:        256,
+		MaxIdleConnsPerHost: 128,
+		MaxConnsPerHost:     128,
 		IdleConnTimeout:     90 * time.Second,
 		DisableCompression:  true,
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: !settings.VerifyTLS},
