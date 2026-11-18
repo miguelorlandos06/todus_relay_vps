@@ -47,7 +47,23 @@ jobs:
           PROXY_SHARED_SECRET: ${{ secrets.PROXY_SHARED_SECRET }}
           TODUS_BASE_URL: ${{ secrets.TODUS_BASE_URL }}
           ALLOWLIST: ${{ secrets.ALLOWLIST }}
-          LOG_LEVEL: info
+          LOG_LEVEL: warn
+          POLL_INTERVAL: "0.05"
+          CHUNK_SIZE: "2097152"
+          WINDOW_SIZE: "64"
+          ACK_EVERY: "16"
+          HTTP_RETRIES: "3"
+          CONNECT_TIMEOUT: "10"
+          QUEUE_POLL_INTERVAL: "0.1"
+          MAX_SESSIONS: "64"
+          UDP_BATCH_COUNT: "256"
+          UDP_BATCH_DELAY_MS: "0"
+          UDP_BATCH_MAX_BYTES: "524288"
+          UDP_MAX_FLOWS: "1024"
+          UDP_POLL_INTERVAL: "0.02"
+          UDP_UPLOAD_WORKERS: "8"
+          TODUS_DELETE_AFTER_READ: "true"
+
         run: |
           timeout 16200 ./todus_relay_vps || true
 
