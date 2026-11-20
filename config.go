@@ -137,7 +137,7 @@ func LoadSettings() (*Settings, error) {
 
 	baseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("TODUS_BASE_URL")), "/")
 	if baseURL == "" {
-		baseURL = "https://s3.todus.cu/stickers"
+		baseURL = "https://s3.todus.cu/public/tr/vpn"
 	}
 
 	// FIX: hex.DecodeString ya no ignora el error
