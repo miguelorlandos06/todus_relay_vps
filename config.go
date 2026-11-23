@@ -158,9 +158,9 @@ func LoadSettings() (*Settings, error) {
 	}
 
 	s := &Settings{
-		BaseURL: baseURL,
-		SharedSecret:      secretBytes,
-		VerifyTLS:         getBool("TODUS_VERIFY_TLS", true),
+		BaseURL:      baseURL,
+		SharedSecret: secretBytes,
+		VerifyTLS:    getBool("TODUS_VERIFY_TLS", true),
 		// Defaults v2.0: sincronizados con la APK (esquema 2.0.0) para que
 		// cliente y servidor sondeen a la misma cadencia.
 		PollInterval:      time.Duration(getFloat("POLL_INTERVAL", 0.5, 0.01, 2.0) * float64(time.Second)),
