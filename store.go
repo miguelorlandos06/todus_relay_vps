@@ -67,10 +67,12 @@ type TodusStore struct {
 
 func NewTodusStore(settings *Settings) *TodusStore {
 	tr := &http.Transport{
+		// v2.0: pool ampliado (256 por host) para sostener 14 sesiones con
+		// prefetch sin cerrar conexiones: el handshake TLS es lo más caro.
 		MaxIdleConns:        256,
-		MaxIdleConnsPerHost: 128,
-		MaxConnsPerHost:     128,
-		IdleConnTimeout:     90 * time.Second,
+		MaxIdleConnsPerHost: 256,
+		MaxConnsPerHost:     256,
+		IdleConnTimeout:     120 * time.Second,
 		DisableCompression:  true,
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: !settings.VerifyTLS},
 	}
@@ -169,6 +171,19 @@ func (s *TodusStore) open(key string, envelope []byte) []byte {
 	return blob
 }
 
+// newRequest crea la petición base con UA y Host opcionales (v2.0).
+func (s *TodusStore) newRequest(method, targetURL string, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequest(method, targetURL, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", s.userAgent())
+	if s.settings.HostHeader != "" {
+		req.Host = s.settings.HostHeader
+	}
+	return req, nil
+}
+
 // userAgent permite sobrescribir el UA vía USER_AGENT (para no depender
 // siempre del curl por defecto y reducir fingerprinting).
 func (s *TodusStore) userAgent() string {
@@ -176,6 +191,16 @@ func (s *TodusStore) userAgent() string {
 		return ua
 	}
 	return "curl/8.23.0"
+}
+
+// maxBodySize acota la lectura de respuestas (64 MiB) para no desbordar la
+// memoria ante respuestas anómalas del bucket.
+const maxBodySize = 64 << 20
+
+// readBody lee y cierra el cuerpo acotado a maxBodySize.
+func readBody(resp *http.Response) ([]byte, error) {
+	defer resp.Body.Close()
+	return io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
 }
 
 // Get mantiene la firma original ([]byte) para los bucles de polling
@@ -196,12 +221,11 @@ func (s *TodusStore) GetWithStatus(key string, retries int) ([]byte, StoreStatus
 	var lastStatus StoreStatus
 	for attempt := 0; attempt <= retries; attempt++ {
 		s.Gets.Add(1)
-		req, err := http.NewRequest(http.MethodGet, targetURL, nil)
+		req, err := s.newRequest(http.MethodGet, targetURL, nil)
 		if err != nil {
 			lastStatus = StatusNetworkError
 			continue
 		}
-		req.Header.Set("User-Agent", s.userAgent())
 		resp, err := s.client.Do(req)
 		if err != nil {
 			lastStatus = StatusNetworkError
@@ -211,8 +235,7 @@ func (s *TodusStore) GetWithStatus(key string, retries int) ([]byte, StoreStatus
 			time.Sleep(backoff)
 			continue
 		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		body, _ := readBody(resp)
 		switch {
 		case resp.StatusCode == http.StatusOK:
 			return s.open(key, body), StatusFound
@@ -242,11 +265,10 @@ func (s *TodusStore) Put(key string, data []byte) bool {
 	sealed := s.seal(key, data)
 	for attempt := 0; attempt <= s.settings.HTTPRetries; attempt++ {
 		s.Puts.Add(1)
-		req, err := http.NewRequest(http.MethodPut, targetURL, bytes.NewReader(sealed))
+		req, err := s.newRequest(http.MethodPut, targetURL, bytes.NewReader(sealed))
 		if err != nil {
 			continue
 		}
-		req.Header.Set("User-Agent", s.userAgent())
 		resp, err := s.client.Do(req)
 		if err != nil {
 			s.PutErrs.Add(1)
@@ -255,7 +277,7 @@ func (s *TodusStore) Put(key string, data []byte) bool {
 			time.Sleep(backoff)
 			continue
 		}
-		io.Copy(io.Discard, resp.Body)
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			return true
@@ -278,17 +300,16 @@ func (s *TodusStore) Put(key string, data []byte) bool {
 
 func (s *TodusStore) Delete(key string) bool {
 	targetURL := s.buildURL(key)
-	req, err := http.NewRequest(http.MethodDelete, targetURL, nil)
+	req, err := s.newRequest(http.MethodDelete, targetURL, nil)
 	if err != nil {
 		return false
 	}
-	req.Header.Set("User-Agent", s.userAgent())
 	resp, err := s.client.Do(req)
 	if err != nil {
 		slog.Debug("delete error red", "key", key, "err", err)
 		return false
 	}
-	io.Copy(io.Discard, resp.Body)
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 	resp.Body.Close()
 	s.Deletes.Add(1)
 	return resp.StatusCode == 200 || resp.StatusCode == 202 || resp.StatusCode == 204 || resp.StatusCode == 404

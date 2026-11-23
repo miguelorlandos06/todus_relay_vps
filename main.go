@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"math/rand/v2"
 	"net"
 	"os"
 	"strings"
@@ -52,9 +53,16 @@ func shortID(id string) string {
 	return id
 }
 
+// waitForWindow bloquea hasta que el cliente acuse recibo suficiente para
+// seguir publicando (control de flujo s2c).
+//
+// v2.0: sondeo ADAPTATIVO — mientras la ventana no avanza, el intervalo de
+// sondeo del ACK se duplica progresivamente (hasta 4× PollInterval) para no
+// saturar el bucket con GETs inútiles durante congestión; en cuanto el ACK
+// avanza, vuelve al intervalo base.
 func waitForWindow(ctx context.Context, sessionID, direction string, sequence uint64, stopCh <-chan struct{}, lastAck *uint64) bool {
-	ticker := time.NewTicker(settings.PollInterval)
-	defer ticker.Stop()
+	interval := settings.PollInterval
+	maxInterval := settings.PollInterval * 4
 	for {
 		select {
 		case <-ctx.Done():
@@ -82,12 +90,23 @@ func waitForWindow(ctx context.Context, sessionID, direction string, sequence ui
 		if store.Get(CloseKey(sessionID), 0) != nil {
 			return false
 		}
+		// Dormir adaptativo: respondemos rápido cuando hay flujo, más lento
+		// cuando estamos bloqueados esperando ACK del cliente.
+		if interval < maxInterval {
+			interval *= 2
+			if interval > maxInterval {
+				interval = maxInterval
+			}
+		}
+		timer := time.NewTimer(interval)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return false
 		case <-stopCh:
+			timer.Stop()
 			return false
-		case <-ticker.C:
+		case <-timer.C:
 		}
 	}
 }
@@ -245,6 +264,13 @@ func handleUDPSession(ctx context.Context, sessionID string) {
 	var seq uint64
 	lastAct := time.Now()
 	closeSeen := false
+	// v2.0: el chequeo de CloseKey se espacia (antes era un GET extra POR
+	// sondeo); 500 ms de latencia de cierre es imperceptible para UDP.
+	closeCheckEvery := 500 * time.Millisecond
+	if closeCheckEvery < settings.UDPPollInterval {
+		closeCheckEvery = settings.UDPPollInterval
+	}
+	var lastCloseCheck time.Time
 	defer func() {
 		fmu.Lock()
 		for _, f := range flows {
@@ -262,8 +288,11 @@ func handleUDPSession(ctx context.Context, sessionID string) {
 			return
 		default:
 		}
-		if store.Get(CloseKey(sessionID), 0) != nil {
-			closeSeen = true
+		if time.Since(lastCloseCheck) >= closeCheckEvery {
+			lastCloseCheck = time.Now()
+			if store.Get(CloseKey(sessionID), 0) != nil {
+				closeSeen = true
+			}
 		}
 		raw := store.Get(UDPDataKey("c2s", sessionID, seq), 0)
 		if raw == nil {
@@ -322,6 +351,103 @@ func handleUDPSession(ctx context.Context, sessionID string) {
 	}
 }
 
+// framePrefetcher descarga bloques c2s POR ADELANTADO (v2.0).
+//
+// Antes, el bucle de descarga era secuencial: GET(seq N) → escribir → dormir
+// → GET(seq N+1). Con POLL_INTERVAL=0.5 s eso limita el caudal a ~2 bloques/s
+// aunque el bucket responda en 150 ms. El prefetcher mantiene hasta
+// prefetchDepth bloques ya descifrados en un canal, de modo que el GET del
+// bloque N+1 se solapa con la escritura del N: la latencia del sondeo deja
+// de estar en el camino crítico.
+type framePrefetcher struct {
+	sessionID string
+	frames    chan []byte
+	stopped   chan struct{}
+	wg        sync.WaitGroup
+	// closed se marca cuando el cliente pidió cerrar la sesión.
+	closed atomic.Bool
+}
+
+const prefetchDepth = 8
+
+func startFramePrefetcher(ctx context.Context, sessionID string, stopCh <-chan struct{}) *framePrefetcher {
+	p := &framePrefetcher{
+		sessionID: sessionID,
+		frames:    make(chan []byte, prefetchDepth),
+		stopped:   make(chan struct{}),
+	}
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		defer close(p.frames)
+		var seq uint64
+		// El chequeo de CloseKey se espacia: solo hace falta entre sondeos
+		// sin datos, no en cada vuelta (antes era un GET extra POR FRAME).
+		closeCheckEvery := 500 * time.Millisecond
+		if closeCheckEvery < settings.PollInterval {
+			closeCheckEvery = settings.PollInterval
+		}
+		var lastCloseCheck time.Time // zero → primer chequeo inmediato
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stopCh:
+				return
+			case <-p.stopped:
+				return
+			default:
+			}
+			key := DataKey("c2s", sessionID, seq)
+			raw := store.Get(key, 0)
+			if raw == nil {
+				// Sin datos: ¿el cliente ya terminó o pidió cerrar?
+				if time.Since(lastCloseCheck) >= closeCheckEvery {
+					lastCloseCheck = time.Now()
+					if store.Get(CloseKey(sessionID), 0) != nil {
+						p.closed.Store(true)
+						return
+					}
+				}
+				if fin := store.Get(FinKey("c2s", sessionID), 0); fin != nil && seq >= DecodeCounter(fin) {
+					return // el cliente terminó de enviar: fin del stream c2s
+				}
+				time.Sleep(settings.PollInterval)
+				continue
+			}
+			payload, err := DecodeFrame(raw, seq)
+			if err != nil {
+				slog.Warn("tcp decode frame error (prefetch)", "session", shortID(sessionID), "seq", seq, "err", err)
+				seq++ // bloque corrupto: saltar (igual que el bucle original)
+				continue
+			}
+			if settings.DeleteAfterRead {
+				store.Delete(key)
+			}
+			select {
+			case p.frames <- payload:
+			case <-ctx.Done():
+				return
+			case <-stopCh:
+				return
+			case <-p.stopped:
+				return
+			}
+			seq++
+		}
+	}()
+	return p
+}
+
+func (p *framePrefetcher) stop() {
+	select {
+	case <-p.stopped:
+	default:
+		close(p.stopped)
+	}
+	p.wg.Wait()
+}
+
 func handleTCPSession(ctx context.Context, sessionID string, target SessionTarget) {
 	// FIX: aplicar allowlist antes de dial
 	if !allow.Allow(target.Host, target.Port) {
@@ -337,6 +463,10 @@ func handleTCPSession(ctx context.Context, sessionID string, target SessionTarge
 		return
 	}
 	defer remote.Close()
+	// v2.0: TCP_NODELAY explícito (baja latencia de writes pequeños).
+	if tcp, ok := remote.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
+	}
 	publishStatus(sessionID, "ready", "")
 	slog.Info("tcp session iniciada", "session", shortID(sessionID), "addr", addr)
 
@@ -373,8 +503,6 @@ func handleTCPSession(ctx context.Context, sessionID string, target SessionTarge
 				if errors.As(err, &ne) && ne.Timeout() {
 					continue
 				}
-				// FIX: el bloque `if err != io.EOF {}` vacío del original se reemplaza
-				// por un manejo explícito: EOF = cierre limpio (debug), otro = warn.
 				if err == io.EOF {
 					slog.Debug("tcp remote EOF", "session", shortID(sessionID), "seq", seq)
 				} else {
@@ -398,76 +526,102 @@ func handleTCPSession(ctx context.Context, sessionID string, target SessionTarge
 		store.Put(FinKey("s2c", sessionID), EncodeCounter(seq))
 	}()
 
+	// v2.0: descarga c2s con prefetch (GET del bloque N+1 solapado con la
+	// escritura del N) y chequeo de cierre espaciado.
+	prefetch := startFramePrefetcher(ctx, sessionID, stopCh)
+
 	var seq uint64
 	var sinceAck int
 	lastAckTime := time.Now()
 	clientFin := false
 	defer func() {
 		stop()
+		prefetch.stop()
 		remote.Close()
 		upWg.Wait()
 		publishStatus(sessionID, "closed", "")
 		slog.Info("tcp session cerrada", "session", shortID(sessionID), "seq", seq)
 	}()
-	for {
+	// Bucle consumidor: escribe los bloques ya descargados en orden.
+	idleTimeout := time.Duration(math.Max(float64(settings.HTTPTimeout*3), 90*float64(time.Second)))
+	done := false
+	for !done {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
-		if store.Get(CloseKey(sessionID), 0) != nil {
+		var payload []byte
+		var ok bool
+		remoteClosed := false
+		// Esperar bloque prefetch o timeout de inactividad (sin sondeo activo
+		// aquí: el prefetcher ya hace los GET).
+		blockTimer := time.NewTimer(idleTimeout)
+		select {
+		case <-ctx.Done():
+			blockTimer.Stop()
+			return
+		case payload, ok = <-prefetch.frames:
+			blockTimer.Stop()
+			if !ok {
+				// Canal cerrado: fin c2s (fin del cliente o close pedido).
+				if sinceAck > 0 {
+					store.Put(AckKey("c2s", sessionID), EncodeCounter(seq))
+				}
+				clientFin = true
+				if tcp, okc := remote.(*net.TCPConn); okc {
+					tcp.CloseWrite()
+				}
+				done = true
+			}
+		case <-remoteFin:
+			// El remoto cerró mientras esperábamos datos: no seguir
+			// consumiendo; terminar limpio.
+			blockTimer.Stop()
+			slog.Debug("tcp remote closed mientras se esperaban datos", "session", shortID(sessionID), "seq", seq)
+			remoteClosed = true
+		case <-blockTimer.C:
+			last := time.Unix(0, atomic.LoadInt64(&lastAct))
+			if time.Since(last) > idleTimeout {
+				slog.Info("tcp session timeout inactividad", "session", shortID(sessionID))
+				done = true
+			}
+			_ = remoteClosed
+		}
+		if done || remoteClosed {
 			break
 		}
-		raw := store.Get(DataKey("c2s", sessionID, seq), 0)
-		if raw != nil {
-			payload, err := DecodeFrame(raw, seq)
-			if err == nil && len(payload) > 0 {
-				// FIX: usar WriteTimeout (no ConnectTimeout) y registrar errores de write
-				remote.SetWriteDeadline(time.Now().Add(settings.WriteTimeout))
-				if _, werr := remote.Write(payload); werr != nil {
-					slog.Warn("tcp remote write error", "session", shortID(sessionID), "seq", seq, "err", werr)
-					break
-				}
-			} else if err != nil {
-				slog.Warn("tcp decode frame error", "session", shortID(sessionID), "seq", seq, "err", err)
-			}
-			if settings.DeleteAfterRead {
-				store.Delete(DataKey("c2s", sessionID, seq))
-			}
-			seq++
-			sinceAck++
-			atomic.StoreInt64(&lastAct, time.Now().UnixNano())
-			if sinceAck >= settings.AckEvery || time.Since(lastAckTime) > 5*time.Second {
-				store.Put(AckKey("c2s", sessionID), EncodeCounter(seq))
-				sinceAck = 0
-				lastAckTime = time.Now()
-			}
-			continue
-		}
-		if fin := store.Get(FinKey("c2s", sessionID), 0); fin != nil && seq >= DecodeCounter(fin) && !clientFin {
-			if sinceAck > 0 {
-				store.Put(AckKey("c2s", sessionID), EncodeCounter(seq))
-			}
-			clientFin = true
-			if tcp, ok := remote.(*net.TCPConn); ok {
-				tcp.CloseWrite()
+		if len(payload) > 0 {
+			// FIX: usar WriteTimeout (no ConnectTimeout) y registrar errores de write
+			remote.SetWriteDeadline(time.Now().Add(settings.WriteTimeout))
+			if _, werr := remote.Write(payload); werr != nil {
+				slog.Warn("tcp remote write error", "session", shortID(sessionID), "seq", seq, "err", werr)
+				return
 			}
 		}
-		remoteDone := false
+		seq++
+		sinceAck++
+		atomic.StoreInt64(&lastAct, time.Now().UnixNano())
+		if sinceAck >= settings.AckEvery || time.Since(lastAckTime) > 5*time.Second {
+			store.Put(AckKey("c2s", sessionID), EncodeCounter(seq))
+			sinceAck = 0
+			lastAckTime = time.Now()
+		}
+		if prefetch.closed.Load() {
+			// El cliente pidió cerrar: no seguir escribiendo.
+			break
+		}
+	}
+
+	// Half-close drenado: si el cliente terminó de enviar, esperar a que el
+	// remoto termine de responder (media conexión s2c).
+	if clientFin {
 		select {
 		case <-remoteFin:
-			remoteDone = true
-		default:
+		case <-ctx.Done():
+		case <-time.After(idleTimeout):
+			slog.Info("tcp drain timeout", "session", shortID(sessionID))
 		}
-		if clientFin && remoteDone {
-			break
-		}
-		last := time.Unix(0, atomic.LoadInt64(&lastAct))
-		if time.Since(last) > time.Duration(math.Max(float64(settings.HTTPTimeout*3), 90*float64(time.Second))) {
-			slog.Info("tcp session timeout inactividad", "session", shortID(sessionID))
-			break
-		}
-		time.Sleep(settings.PollInterval)
 	}
 }
 
@@ -626,6 +780,9 @@ func worker(ctx context.Context) {
 			wait = settings.QueuePollInterval * 4
 			slog.Warn("bucket rate-limitando, backoff extendido", "wait", wait)
 		}
+		// v2.0: jitter ±20 % para no sincronizarse con el patrón de sondeo
+		// del cliente (reduce colisiones de rate limit).
+		wait += time.Duration(rand.Int64N(int64(wait)/2+1)) - wait/4
 		select {
 		case <-ctx.Done():
 			slog.Info("worker detenido (ctx cancelado)")

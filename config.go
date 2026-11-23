@@ -41,6 +41,10 @@ type Settings struct {
 	SessionMaxDuration time.Duration
 	ShutdownTimeout    time.Duration
 	LogLevel           string
+
+	// v2.0: cabecera Host opcional para el buzón (paridad con la APK, que
+	// envía Host: status.todus.cu). Vacío = usar el host de la URL.
+	HostHeader string
 }
 
 func loadEnvFile(path string) {
@@ -137,7 +141,10 @@ func LoadSettings() (*Settings, error) {
 
 	baseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("TODUS_BASE_URL")), "/")
 	if baseURL == "" {
-		baseURL = "https://s3.todus.cu/public/tr/vpn"
+		// v2.0: bucket nuevo del buzón (antes https://s3.todus.cu/stickers).
+		// Nota: el prefijo del buzón se puede sobreescribir con TODUS_BASE_URL
+		// (p. ej. https://s3.todus.cu/public/tr/vpn) sin recompilar.
+		baseURL = "https://s3.todus.cu/public"
 	}
 
 	// FIX: hex.DecodeString ya no ignora el error
@@ -151,25 +158,27 @@ func LoadSettings() (*Settings, error) {
 	}
 
 	s := &Settings{
-		BaseURL:           baseURL,
+		BaseURL: baseURL,
 		SharedSecret:      secretBytes,
 		VerifyTLS:         getBool("TODUS_VERIFY_TLS", true),
-		PollInterval:      time.Duration(getFloat("POLL_INTERVAL", 0.05, 0.01, 2.0) * float64(time.Second)),
-		ChunkSize:         getInt("CHUNK_SIZE", 262144, 4096, 8388608),
-		WindowSize:        getInt("WINDOW_SIZE", 8, 1, 128),
-		AckEvery:          getInt("ACK_EVERY", 4, 1, 32),
-		HTTPTimeout:       time.Duration(getFloat("HTTP_TIMEOUT", 20.0, 2.0, 120.0) * float64(time.Second)),
-		HTTPRetries:       getInt("HTTP_RETRIES", 3, 0, 10),
-		ConnectTimeout:    time.Duration(getFloat("CONNECT_TIMEOUT", 30.0, 3.0, 180.0) * float64(time.Second)),
+		// Defaults v2.0: sincronizados con la APK (esquema 2.0.0) para que
+		// cliente y servidor sondeen a la misma cadencia.
+		PollInterval:      time.Duration(getFloat("POLL_INTERVAL", 0.5, 0.01, 2.0) * float64(time.Second)),
+		ChunkSize:         getInt("CHUNK_SIZE", 1048576, 4096, 8388608),
+		WindowSize:        getInt("WINDOW_SIZE", 24, 1, 128),
+		AckEvery:          getInt("ACK_EVERY", 6, 1, 32),
+		HTTPTimeout:       time.Duration(getFloat("HTTP_TIMEOUT", 25.0, 2.0, 120.0) * float64(time.Second)),
+		HTTPRetries:       getInt("HTTP_RETRIES", 4, 0, 10),
+		ConnectTimeout:    time.Duration(getFloat("CONNECT_TIMEOUT", 25.0, 3.0, 180.0) * float64(time.Second)),
 		WriteTimeout:      time.Duration(getFloat("WRITE_TIMEOUT", 15.0, 1.0, 120.0) * float64(time.Second)),
-		QueuePollInterval: time.Duration(getFloat("QUEUE_POLL_INTERVAL", 0.5, 0.1, 10.0) * float64(time.Second)),
-		MaxSessions:       getInt("MAX_SESSIONS", 64, 1, 512),
-		UDPBatchCount:     getInt("UDP_BATCH_COUNT", 32, 1, 512),
-		UDPBatchDelayMS:   time.Duration(getInt("UDP_BATCH_DELAY_MS", 5, 0, 100)) * time.Millisecond,
-		UDPBatchMaxBytes:  getInt("UDP_BATCH_MAX_BYTES", 49152, 1200, 2097152),
-		UDPMaxFlows:       getInt("UDP_MAX_FLOWS", 128, 1, 4096),
-		UDPPollInterval:   time.Duration(getFloat("UDP_POLL_INTERVAL", 0.02, 0.005, 1.0) * float64(time.Second)),
-		UDPUploadWorkers:  getInt("UDP_UPLOAD_WORKERS", 4, 1, 16),
+		QueuePollInterval: time.Duration(getFloat("QUEUE_POLL_INTERVAL", 0.3, 0.05, 10.0) * float64(time.Second)),
+		MaxSessions:       getInt("MAX_SESSIONS", 14, 1, 512),
+		UDPBatchCount:     getInt("UDP_BATCH_COUNT", 64, 1, 512),
+		UDPBatchDelayMS:   time.Duration(getInt("UDP_BATCH_DELAY_MS", 50, 0, 100)) * time.Millisecond,
+		UDPBatchMaxBytes:  getInt("UDP_BATCH_MAX_BYTES", 131072, 1200, 2097152),
+		UDPMaxFlows:       getInt("UDP_MAX_FLOWS", 160, 1, 4096),
+		UDPPollInterval:   time.Duration(getFloat("UDP_POLL_INTERVAL", 0.06, 0.005, 1.0) * float64(time.Second)),
+		UDPUploadWorkers:  getInt("UDP_UPLOAD_WORKERS", 6, 1, 16),
 		DeleteAfterRead:   getBool("TODUS_DELETE_AFTER_READ", false),
 
 		// Mejoras
@@ -179,6 +188,7 @@ func LoadSettings() (*Settings, error) {
 		SessionMaxDuration: time.Duration(getFloat("SESSION_MAX_DURATION", 14400, 60, 21600) * float64(time.Second)),
 		ShutdownTimeout:    time.Duration(getFloat("SHUTDOWN_TIMEOUT", 20.0, 5.0, 60.0) * float64(time.Second)),
 		LogLevel:           getString("LOG_LEVEL", "info"),
+		HostHeader:         strings.TrimRight(strings.TrimSpace(os.Getenv("TODUS_HOST_HEADER")), ""),
 	}
 
 	if len(s.Allowlist) == 0 {

@@ -4,10 +4,20 @@ Relay de túnel TCP/UDP sobre almacenamiento S3, escrito en Go 1.22 usando **sol
 
 > **Versión mejorada.** Esta versión corrige los bugs del original (if vacío en `main.go:150`, fuga de memoria del mapa `seen`, errores de write ignorados, etc.) y añade: cifrado AES-GCM del payload, allowlist de destinos, SIGTERM graceful, logging estructurado (`log/slog`), heartbeat, distinción 404/403/429 en S3, y un workflow de GitHub Actions con schedule cron y shutdown limpio.
 
+> **Versión 2.0.** Sincronizada con la APK ToDus Relay VPN 2.0.0:
+> - **Bucket nuevo**: `TODUS_BASE_URL=https://s3.todus.cu/public`.
+> - **Defaults sincronizados con la APK**: poll 0.5 s, chunk 1 MiB, ventana 24, ACK cada 6, sesiones 14, UDP 64/50 ms/128 KiB/160 flujos/poll 60 ms/6 workers.
+> - **Prefetch c2s con pipeline** (`framePrefetcher`): el GET del bloque N+1 se solapa con la escritura del N (hasta 8 bloques por delante); la latencia del sondeo deja de limitar el caudal de descarga.
+> - **Sondeo adaptativo de ACK** en `waitForWindow`: mientras la ventana no avanza, el intervalo crece hasta 4× para no saturar el bucket con GETs inútiles.
+> - **Chequeo de cierre espaciado** (500 ms) en TCP y UDP: elimina un GET extra por sondeo/frame.
+> - **Pool HTTP ampliado** (256 conexiones por host, keep-alive 120 s) y lectura de cuerpos acotada (`io.LimitReader`, 64 MiB).
+> - **TCP_NODELAY** explícito en los destinos y **jitter ±20 %** en el sondeo de la cola.
+> - `TODUS_HOST_HEADER` opcional (paridad con la APK, que envía `Host: status.todus.cu`).
+
 ## Arquitectura
 
 ```
-Cliente ──(HTTP PUT/GET/DELETE anónimo)──> Bucket S3 (s3.todus.cu/stickers)
+Cliente ──(HTTP PUT/GET/DELETE anónimo)──> Bucket S3 (s3.todus.cu/public)
                                               ▲
                                               │ sondeo (poll)
                                               │
@@ -41,7 +51,7 @@ Copia `.env.example` a `.env` y rellena los valores, o define las variables de e
 | Variable | Default | Descripción |
 | --- | --- | --- |
 | `PROXY_SHARED_SECRET` | (obligatorio) | Secreto HMAC + AES en hex, mínimo 32 bytes. `openssl rand -hex 32` |
-| `TODUS_BASE_URL` | `https://s3.todus.cu/stickers` | URL del bucket |
+| `TODUS_BASE_URL` | `https://s3.todus.cu/public` | URL del bucket |
 | `ENCRYPTION_ENABLED` | `true` | Cifrado AES-GCM del payload (sobre `TDS3`). `false` = `TDS2` legacy |
 | `ALLOWLIST` | (vacío) | Reglas `host:port` separadas por coma. Vacío = permitir todo (con warning) |
 | `HEARTBEAT_INTERVAL` | `60` | Segundos entre logs de heartbeat (evita cancelación por inactividad en GH Actions) |
